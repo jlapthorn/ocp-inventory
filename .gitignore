@@ -1,5 +1,8 @@
 .claude/
 __pycache__/
 *.pyc
+# Collector run folders and their archives (contain real cluster inventory)
+OCP_Inventory_*/
 ocp_inventory_*/
+billable_report_*.pdf
 *.zip
