@@ -20,16 +20,43 @@ Reads (per run folder, all optional except nodes.csv):
   addons.csv           — ACS / ACM / ODF / Quay detection
   operators.csv        — installed operator subscriptions
 
-Billable verdicts are read from the 'Billable (Heuristic)' column when present.
-For legacy (v2.x) outputs without that column the verdict is re-derived from
-Role + Topology using the same rules as ocp_inventory_cli_v3.py:
-  - SNO / Compact topology : every node is billable (masters run workloads)
-  - Standard topology      : control-plane exempt, infra-only exempt, workers billable
+Billable verdicts are decided here rather than read from the collector's
+'Billable (Heuristic)' column:
+
+One OpenShift subscription unit covers 2 cores, taken here as 4 vCPUs. Per-node
+counts are rounded up and summed, because a part-used unit cannot be shared
+between nodes.
+
+  - SNO / Compact topology        : every node is billable (masters run workloads)
+  - control-plane / master        : exempt, High confidence
+  - infra label + infra taint     : exempt, High confidence
+  - infra label, no infra taint   : exempt, Medium confidence
+  - everything else               : billable, High confidence
+
+Red Hat keys the exemption on the presence of the node-role.kubernetes.io/infra
+label (KCS 5034771). The worker label may legitimately sit alongside it, because
+machine sets derived from the worker template produce 'infra,worker' nodes by
+design so the node stays managed by the default worker machine config pool. The
+worker role is therefore ignored when deciding whether a node is infrastructure.
+What matters is the taint: a NoSchedule or NoExecute taint on the infra key is
+what keeps user workloads off, so it separates a High-confidence exemption from
+a Medium-confidence one.
+
+Where this disagrees with the collector, the node is listed in a 'reclassified'
+table on that cluster's page and this report's verdict is the one counted.
 
 Usage:
   python3 billable_report_v3.py OCP_Inventory_<id>_<cluster>_<date>
   python3 billable_report_v3.py run_a run_b run_c -o estate_billable.pdf
   python3 billable_report_v3.py --input ./all_runs
+  python3 billable_report_v3.py --input nodes.csv
+  python3 billable_report_v3.py --input combined_outputs/combined_nodes.csv
+
+A --input file is read as a nodes.csv: either the per-cluster file from a run
+folder or combined_nodes.csv from combine_ocp_outputs_v3.py. Rows are grouped by
+Cluster ID, so a combined file produces one report section per cluster. Only
+node-level facts are available on that path -- add-on, Platform Plus and
+operator sections are reported as unavailable.
 
 Requires: reportlab  (pip install reportlab)
 """
@@ -70,6 +97,20 @@ BILLABLE   = colors.HexColor('#9a3412')
 EXEMPT     = colors.HexColor('#2f6f4f')
 
 ADDON_NAMES = ('ACS', 'ACM', 'ODF', 'Quay')
+
+INFRA_TAINT_KEY = 'node-role.kubernetes.io/infra'
+BLOCKING_EFFECTS = ('NoSchedule', 'NoExecute')
+
+# One OpenShift subscription unit covers 2 cores, i.e. 4 vCPUs on a
+# hyperthreaded host where 2 vCPUs present as 1 core.
+VCPUS_PER_SUBSCRIPTION = 4
+
+
+def subscriptions_for(vcpus):
+    """Subscription units needed to cover a node of `vcpus` vCPUs."""
+    if not vcpus or vcpus <= 0:
+        return 0
+    return int(math.ceil(float(vcpus) / VCPUS_PER_SUBSCRIPTION))
 
 # ---------------------------------------------------------------------------
 # Input helpers
@@ -162,10 +203,56 @@ def find_run_folders(paths, scan_root=None):
 # ---------------------------------------------------------------------------
 
 
-def derive_billable(role, topology):
+def parse_taints(taint_str):
     """
-    Fallback billable verdict for legacy outputs that lack the
-    'Billable (Heuristic)' column. Same rules as ocp_inventory_cli_v3._billable.
+    Parse the collector's Taints column into (key, value, effect) tuples.
+
+    The column is written by ocp_inventory_cli_v3._extract_taints as
+    'key=value:Effect' or 'key:Effect' when there is no value, multiple taints
+    joined by '; ', and the literal 'None' when the node has no taints.
+    """
+    out = []
+    raw = (taint_str or '').strip()
+    if not raw or raw.lower() == 'none':
+        return out
+
+    for part in raw.split(';'):
+        part = part.strip()
+        if not part:
+            continue
+        key_value, sep, effect = part.rpartition(':')
+        if not sep:
+            key_value, effect = part, ''
+        key, _, value = key_value.partition('=')
+        out.append((key.strip(), value.strip(), effect.strip()))
+    return out
+
+
+def has_infra_taint(taint_str):
+    """True when a scheduling-blocking infra taint is present on the node."""
+    for key, _value, effect in parse_taints(taint_str):
+        if key == INFRA_TAINT_KEY and effect in BLOCKING_EFFECTS:
+            return True
+    return False
+
+
+def classify_node(role, topology, taint_str):
+    """
+    Decide whether a node is billable. This is the report's own rule and it
+    takes precedence over the collector's 'Billable (Heuristic)' column.
+
+    Red Hat keys the subscription exemption on the presence of the
+    node-role.kubernetes.io/infra label (KCS 5034771). The worker label may sit
+    alongside it: machine sets derived from the worker template produce
+    'infra,worker' nodes by design, so the node stays managed by the default
+    worker machine config pool. The worker role is therefore NOT considered
+    when deciding whether a node is infrastructure.
+
+    The exemption is conditional on the node running only infrastructure
+    workloads. A scheduling-blocking infra taint is what enforces that, so the
+    taint decides whether the exemption is High or Medium confidence.
+
+    Returns (is_billable, confidence, evidence).
     """
     roles = set(r.strip().lower() for r in (role or '').split(',') if r.strip())
 
@@ -173,14 +260,96 @@ def derive_billable(role, topology):
         return (True, 'High',
                 'All nodes billable in {0} topology per subscription guide'.format(topology))
 
-    is_master = ('master' in roles) or ('control-plane' in roles)
-    is_infra_only = ('infra' in roles) and ('worker' not in roles)
-
-    if is_master:
+    if ('master' in roles) or ('control-plane' in roles):
         return (False, 'High', 'Control plane node - exempt')
-    if is_infra_only:
-        return (False, 'Medium', 'Infra-only node - exempt (verify no user workloads)')
+
+    if 'infra' in roles:
+        if has_infra_taint(taint_str):
+            return (False, 'High',
+                    'Infra node - exempt; infra label present and {0} taint blocks '
+                    'user workloads'.format(INFRA_TAINT_KEY))
+        return (False, 'Medium',
+                'Infra node - exempt on the infra label, but no blocking infra taint '
+                'is set, so user workloads could schedule here')
+
     return (True, 'High', 'Worker node - billable')
+
+
+def summarise_node_rows(nodes, topology):
+    """
+    Classify a list of nodes.csv rows.
+
+    Returns (billable, exempt, overrides, sizing) where overrides records every
+    node whose verdict differs from the one the collector wrote, and sizing
+    holds the CPU and core-pair figures.
+    """
+    billable, exempt, overrides = [], [], []
+
+    for node in nodes:
+        role = node.get('Role', '') or ''
+        taint_str = node.get('Taints', '') or ''
+        is_billable, confidence, evidence = classify_node(role, topology, taint_str)
+
+        collector_verdict = (node.get('Billable (Heuristic)') or '').strip()
+        if collector_verdict:
+            collector_billable = collector_verdict.lower() == 'yes'
+            if collector_billable != is_billable:
+                overrides.append({
+                    'name': node.get('Node Name', '') or '(unnamed)',
+                    'role': role,
+                    'collector': 'Billable' if collector_billable else 'Exempt',
+                    'report': 'Billable' if is_billable else 'Exempt',
+                    'reason': evidence,
+                })
+
+        entry = {
+            'name': node.get('Node Name', '') or '(unnamed)',
+            'role': role,
+            'created': node.get('Creation Date', '') or '',
+            'instance_type': node.get('Instance Type', '') or '',
+            'zone': node.get('Zone', '') or '',
+            'cpu_capacity': cpu_to_cores(node.get('CPU Capacity (vCPUs)', '')),
+            'cpu_allocatable': cpu_to_cores(node.get('CPU Allocatable (vCPUs)', '')),
+            'memory': node.get('Memory (GiB)', '') or '',
+            'accelerators': to_int(node.get('GPU / Accelerator Count', 0)),
+            'accelerator_types': node.get('Accelerator Type(s)', '') or '',
+            'sub_model': node.get('Subscription Model (Signal)', '') or '',
+            'unschedulable': (node.get('Unschedulable', '') or '').strip().lower() == 'true',
+            'taints': taint_str,
+            'infra_taint': has_infra_taint(taint_str),
+            'subscriptions': subscriptions_for(
+                cpu_to_cores(node.get('CPU Capacity (vCPUs)', ''))),
+            'confidence': confidence,
+            'evidence': evidence,
+        }
+        (billable if is_billable else exempt).append(entry)
+
+    # The worker pool excludes infra-labelled nodes even though they normally
+    # also carry the worker role -- counting their cores inflates the sizing.
+    def in_worker_pool(n):
+        r = n['role'].lower()
+        return 'worker' in r and 'infra' not in r
+
+    everything = billable + exempt
+    worker_capacity = sum(n['cpu_capacity'] for n in everything if in_worker_pool(n))
+    worker_allocatable = sum(n['cpu_allocatable'] for n in everything if in_worker_pool(n))
+    billable_capacity = sum(n['cpu_capacity'] for n in billable)
+
+    sizing = {
+        'worker_capacity': worker_capacity,
+        'worker_allocatable': worker_allocatable,
+        'billable_capacity': billable_capacity,
+        # Core-pairs follow the nodes you actually pay for.
+        'est_core_pairs': (int(math.ceil(billable_capacity / 2.0))
+                           if billable_capacity > 0 else 0),
+        # Subscriptions are rounded up per node: a part-used subscription unit
+        # cannot be shared with another node.
+        'subscriptions': sum(n['subscriptions'] for n in billable),
+        # The same capacity rounded up once, for comparison.
+        'subscriptions_pooled': subscriptions_for(billable_capacity),
+        'total_accelerators': sum(n['accelerators'] for n in everything),
+    }
+    return billable, exempt, overrides, sizing
 
 
 def analyse_cluster(folder):
@@ -205,65 +374,22 @@ def analyse_cluster(folder):
     cluster_name = field('Cluster Name') or (nodes[0].get('Cluster Name', '') if nodes else '')
     cluster_id = field('Cluster ID') or (nodes[0].get('Cluster ID', '') if nodes else '')
 
-    billable, exempt = [], []
-    derived_any = False
+    billable, exempt, overrides, sizing = summarise_node_rows(nodes, topology)
 
-    for node in nodes:
-        verdict = (node.get('Billable (Heuristic)') or '').strip()
-        if verdict:
-            is_billable = verdict.lower() == 'yes'
-            confidence = node.get('Billable Confidence', '') or ''
-            evidence = node.get('Billable Evidence', '') or ''
-        else:
-            derived_any = True
-            is_billable, confidence, evidence = derive_billable(
-                node.get('Role', ''), topology)
-
-        entry = {
-            'name': node.get('Node Name', '') or '(unnamed)',
-            'role': node.get('Role', '') or '',
-            'instance_type': node.get('Instance Type', '') or '',
-            'zone': node.get('Zone', '') or '',
-            'cpu_capacity': cpu_to_cores(node.get('CPU Capacity (vCPUs)', '')),
-            'cpu_allocatable': cpu_to_cores(node.get('CPU Allocatable (vCPUs)', '')),
-            'memory': node.get('Memory (GiB)', '') or '',
-            'accelerators': to_int(node.get('GPU / Accelerator Count', 0)),
-            'accelerator_types': node.get('Accelerator Type(s)', '') or '',
-            'sub_model': node.get('Subscription Model (Signal)', '') or '',
-            'unschedulable': (node.get('Unschedulable', '') or '').strip().lower() == 'true',
-            'confidence': confidence,
-            'evidence': evidence,
-        }
-        (billable if is_billable else exempt).append(entry)
-
-    # Sizing. 'Worker CPU Capacity' mirrors the toolkit (any node whose role
-    # contains 'worker'); billable capacity is the subscription-relevant figure
-    # and differs in SNO/Compact topologies where masters are also billable.
-    worker_capacity = sum(n['cpu_capacity'] for n in billable + exempt
-                          if 'worker' in n['role'].lower())
-    worker_allocatable = sum(n['cpu_allocatable'] for n in billable + exempt
-                             if 'worker' in n['role'].lower())
-    billable_capacity = sum(n['cpu_capacity'] for n in billable)
-
-    est_core_pairs = int(math.ceil(worker_capacity / 2.0)) if worker_capacity > 0 else 0
-    billable_core_pairs = int(math.ceil(billable_capacity / 2.0)) if billable_capacity > 0 else 0
-
-    # Cross-check against the figures the collector recorded.
+    # Record where this report departs from what the collector wrote.
     reported_billable = field('Billable Nodes (Heuristic)', None)
     reported_core_pairs = field('Estimated Core-Pairs (Heuristic)', None)
     discrepancies = []
     if reported_billable not in (None, '') and to_int(reported_billable, -1) != len(billable):
         discrepancies.append(
-            'Collector recorded {0} billable node(s); this report counts {1} from nodes.csv.'
-            .format(reported_billable, len(billable)))
-    if reported_core_pairs not in (None, '') and to_int(reported_core_pairs, -1) != est_core_pairs:
+            'Collector recorded {0} billable node(s); this report finds {1}. See the '
+            'reclassified nodes table below.'.format(reported_billable, len(billable)))
+    if (reported_core_pairs not in (None, '')
+            and to_int(reported_core_pairs, -1) != sizing['est_core_pairs']):
         discrepancies.append(
-            'Collector recorded {0} estimated core-pair(s); recomputed value is {1}.'
-            .format(reported_core_pairs, est_core_pairs))
-    if derived_any:
-        discrepancies.append(
-            'nodes.csv has no "Billable (Heuristic)" column (legacy output); '
-            'verdicts were re-derived from Role and Topology.')
+            'Collector recorded {0} estimated core-pair(s); this report calculates {1} '
+            'from billable capacity only.'.format(reported_core_pairs,
+                                                  sizing['est_core_pairs']))
 
     addon_rows = []
     for row in addons:
@@ -294,12 +420,15 @@ def analyse_cluster(folder):
         'nodes_total': len(billable) + len(exempt),
         'billable': billable,
         'exempt': exempt,
-        'worker_capacity': worker_capacity,
-        'worker_allocatable': worker_allocatable,
-        'billable_capacity': billable_capacity,
-        'est_core_pairs': est_core_pairs,
-        'billable_core_pairs': billable_core_pairs,
-        'total_accelerators': sum(n['accelerators'] for n in billable + exempt),
+        'overrides': overrides,
+        'worker_capacity': sizing['worker_capacity'],
+        'worker_allocatable': sizing['worker_allocatable'],
+        'billable_capacity': sizing['billable_capacity'],
+        'est_core_pairs': sizing['est_core_pairs'],
+        'subscriptions': sizing['subscriptions'],
+        'subscriptions_pooled': sizing['subscriptions_pooled'],
+        'collector_core_pairs': reported_core_pairs,
+        'total_accelerators': sizing['total_accelerators'],
         'accel_addon_signal': field('AI Accelerator Add-on Signal', 'No'),
         'addons': addon_rows,
         'detected_addons': detected_addons,
@@ -310,6 +439,96 @@ def analyse_cluster(folder):
         'operator_count': len(operators),
         'discrepancies': discrepancies,
     }
+
+
+def analyse_nodes_csv(path):
+    """
+    Build cluster records from a standalone nodes.csv -- either the per-cluster
+    file from a run folder or combined_nodes.csv from the combiner. Rows are
+    grouped by Cluster ID so a combined file yields one record per cluster.
+
+    Only node-level facts are available on this path; add-on, operator and
+    platform sections are reported as unavailable.
+    """
+    rows = read_csv_rows(path)
+    if not rows:
+        return []
+
+    if 'Role' not in rows[0]:
+        sys.stderr.write(
+            'ERROR: {0} has no "Role" column -- is this a nodes.csv?\n'.format(path))
+        return []
+
+    groups = []
+    index = {}
+    for row in rows:
+        key = (row.get('Cluster ID', '') or '', row.get('Cluster Name', '') or '')
+        if key not in index:
+            index[key] = []
+            groups.append(key)
+        index[key].append(row)
+
+    clusters = []
+    for cluster_id, cluster_name in groups:
+        # A combined file that includes the same cluster twice (two collections
+        # of one cluster, say) would otherwise double every count. A node name
+        # is unique within a cluster, so first occurrence wins.
+        nodes, seen, duplicates = [], set(), 0
+        for row in index[(cluster_id, cluster_name)]:
+            node_name = row.get('Node Name', '') or ''
+            if node_name and node_name in seen:
+                duplicates += 1
+                continue
+            seen.add(node_name)
+            nodes.append(row)
+
+        topology = (nodes[0].get('Topology Flag', '') or 'Standard').strip() or 'Standard'
+        billable, exempt, overrides, sizing = summarise_node_rows(nodes, topology)
+
+        discrepancies = []
+        if duplicates:
+            discrepancies.append(
+                'Dropped {0} duplicate node row(s) for this cluster — the file contains '
+                'the same node more than once, so it likely holds repeated collections '
+                'of one cluster. Counts below are de-duplicated.'.format(duplicates))
+        if overrides:
+            discrepancies.append(
+                '{0} node(s) reclassified against the collector verdict in this file.'
+                .format(len(overrides)))
+        discrepancies.append(
+            'Built from {0} alone: add-on, Platform Plus and operator sections are '
+            'unavailable, and core-pairs cannot be cross-checked against the '
+            'collector.'.format(os.path.basename(path)))
+
+        clusters.append({
+            'folder': path,
+            'cluster_name': cluster_name or cluster_id or os.path.basename(path),
+            'cluster_id': cluster_id,
+            'topology': topology,
+            'ocp_version': '', 'channel': '', 'platform_type': '',
+            'deployment_type': '', 'edition': '', 'edition_confidence': '',
+            'collected_at': '', 'collection_mode': 'nodes.csv only', 'notes': '',
+            'nodes_total': len(billable) + len(exempt),
+            'billable': billable,
+            'exempt': exempt,
+            'overrides': overrides,
+            'worker_capacity': sizing['worker_capacity'],
+            'worker_allocatable': sizing['worker_allocatable'],
+            'billable_capacity': sizing['billable_capacity'],
+            'est_core_pairs': sizing['est_core_pairs'],
+            'subscriptions': sizing['subscriptions'],
+            'subscriptions_pooled': sizing['subscriptions_pooled'],
+            'collector_core_pairs': None,
+            'total_accelerators': sizing['total_accelerators'],
+            'accel_addon_signal': 'Yes' if sizing['total_accelerators'] > 0 else 'No',
+            'addons': [],
+            'detected_addons': [],
+            'platform_plus': '', 'platform_plus_confidence': '',
+            'platform_plus_evidence': '', 'virtualization': '',
+            'operator_count': 0,
+            'discrepancies': discrepancies,
+        })
+    return clusters
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +617,7 @@ def headline_block(cluster, styles):
         (str(len(cluster['billable'])), 'BILLABLE NODES', BILLABLE),
         (str(len(cluster['exempt'])), 'EXEMPT NODES', EXEMPT),
         (str(cluster['est_core_pairs']), 'EST. CORE-PAIRS', INK),
+        (str(cluster['subscriptions']), 'SUBSCRIPTIONS', BILLABLE),
     ]
     row = []
     for value, label, colour in cells:
@@ -412,7 +632,7 @@ def headline_block(cluster, styles):
         ]))
         row.append(inner)
 
-    table = Table([row], colWidths=[52 * mm] * 3, hAlign='LEFT')
+    table = Table([row], colWidths=[52 * mm] * len(cells), hAlign='LEFT')
     table.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('BACKGROUND', (0, 0), (-1, -1), BAND),
@@ -448,9 +668,10 @@ def cluster_story(cluster, styles, multi_cluster):
     story.append(headline_block(cluster, styles))
     story.append(Spacer(1, 4))
     story.append(Paragraph(
-        '{0} of {1} node(s) are billable under the toolkit heuristic for '
-        '{2} topology.'.format(len(cluster['billable']), cluster['nodes_total'],
-                               cluster['topology'] or 'Standard'),
+        '{0} of {1} node(s) are billable, applying the infra-label and infra-taint '
+        'rule to {2} topology. See the methodology page for the full rule.'.format(
+            len(cluster['billable']), cluster['nodes_total'],
+            cluster['topology'] or 'Standard'),
         styles['body']))
 
     if cluster['discrepancies']:
@@ -470,15 +691,28 @@ def cluster_story(cluster, styles, multi_cluster):
                 '{0:.0f}'.format(n['cpu_capacity']),
                 '{0:.2f}'.format(n['cpu_allocatable']),
                 n['sub_model'] or '-',
+                str(n['subscriptions']),
                 n['accelerators'] or '-',
                 '{0} / {1}'.format(n['confidence'] or '-', n['evidence'] or '-'),
             ])
-        story.append(data_table(
+        rows.append([
+            'TOTAL — {0} billable node(s)'.format(len(cluster['billable'])), '', '',
+            '{0:.0f}'.format(cluster['billable_capacity']), '', '',
+            str(cluster['subscriptions']),
+            str(sum(n['accelerators'] for n in cluster['billable'])) or '-', '',
+        ])
+        table = data_table(
             ['Node', 'Role', 'Instance type', 'vCPU cap', 'vCPU alloc',
-             'Sub model', 'Accel', 'Confidence / evidence'],
+             'Sub model', 'Subs', 'Accel', 'Confidence / evidence'],
             rows,
-            [62 * mm, 24 * mm, 22 * mm, 15 * mm, 16 * mm, 20 * mm, 12 * mm, 60 * mm],
-            styles, align_right=(3, 4, 6)))
+            [58 * mm, 23 * mm, 21 * mm, 15 * mm, 16 * mm, 19 * mm, 12 * mm,
+             12 * mm, 57 * mm],
+            styles, align_right=(3, 4, 6, 7))
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, len(rows)), (-1, len(rows)), BAND),
+            ('LINEABOVE', (0, len(rows)), (-1, len(rows)), 0.8, INK),
+        ]))
+        story.append(table)
     else:
         story.append(Paragraph('No billable nodes identified.', styles['body']))
 
@@ -486,38 +720,76 @@ def cluster_story(cluster, styles, multi_cluster):
     story.append(Paragraph('Exempt nodes', styles['h2']))
     if cluster['exempt']:
         rows = []
+        rows = []
         for n in sorted(cluster['exempt'], key=lambda x: x['name']):
+            is_infra = 'infra' in n['role'].lower()
             rows.append([
                 n['name'], wrappable(n['role']), n['instance_type'] or '-',
                 '{0:.0f}'.format(n['cpu_capacity']),
+                ('Yes' if n['infra_taint'] else 'No') if is_infra else 'n/a',
                 n['confidence'] or '-', n['evidence'] or '-',
             ])
         story.append(data_table(
-            ['Node', 'Role', 'Instance type', 'vCPU cap', 'Confidence', 'Exemption basis'],
+            ['Node', 'Role', 'Instance type', 'vCPU cap', 'Infra taint',
+             'Confidence', 'Exemption basis'],
             rows,
-            [62 * mm, 32 * mm, 24 * mm, 16 * mm, 20 * mm, 77 * mm],
+            [56 * mm, 26 * mm, 22 * mm, 15 * mm, 17 * mm, 19 * mm, 82 * mm],
             styles, align_right=(3,)))
     else:
         story.append(Paragraph('No exempt nodes — every node in this cluster is billable.',
                                styles['body']))
 
+    # --- Reclassified against the collector ---------------------------------
+    if cluster.get('overrides'):
+        story.append(Paragraph('Nodes reclassified against the collector', styles['h2']))
+        story.append(Paragraph(
+            'This report applies the infra-label rule described on the methodology page. '
+            'Where that differs from the verdict in nodes.csv, the node is listed here '
+            'and the report\'s verdict is the one used in the counts above.',
+            styles['body']))
+        story.append(Spacer(1, 4))
+        rows = [[o['name'], wrappable(o['role']), o['collector'], o['report'], o['reason']]
+                for o in sorted(cluster['overrides'], key=lambda x: x['name'])]
+        story.append(data_table(
+            ['Node', 'Role', 'Collector said', 'This report says', 'Why'],
+            rows,
+            [56 * mm, 26 * mm, 26 * mm, 28 * mm, 101 * mm], styles))
+
     # --- Sizing -------------------------------------------------------------
     story.append(Paragraph('Core-pair sizing signal', styles['h2']))
     sizing_rows = [
-        ['Worker CPU capacity (cores)', '{0:.2f}'.format(cluster['worker_capacity']),
-         'Sum over nodes whose role includes "worker" — matches the collector.'],
-        ['Worker CPU allocatable (cores)', '{0:.2f}'.format(cluster['worker_allocatable']),
+        ['Worker pool CPU capacity (cores)', '{0:.2f}'.format(cluster['worker_capacity']),
+         'Nodes with the worker role, excluding infra-labelled nodes. Infra nodes '
+         'usually carry the worker role too; counting their cores here would '
+         'inflate the figure with exempt capacity.'],
+        ['Worker pool CPU allocatable (cores)',
+         '{0:.2f}'.format(cluster['worker_allocatable']),
          'Capacity less reserved system overhead; indicative only.'],
         ['Billable CPU capacity (cores)', '{0:.2f}'.format(cluster['billable_capacity']),
          'Sum over every node marked billable above.'],
-        ['Estimated core-pairs (worker basis)', str(cluster['est_core_pairs']),
-         'ceil(worker CPU capacity / 2) — the collector\'s headline figure.'],
-        ['Estimated core-pairs (billable basis)', str(cluster['billable_core_pairs']),
-         'ceil(billable CPU capacity / 2). Differs from the worker basis in '
-         'SNO/Compact topologies, where control-plane nodes are also billable.'],
-        ['AI accelerator add-on signal', cluster['accel_addon_signal'] or 'No',
-         '{0} accelerator(s) detected across all nodes.'.format(cluster['total_accelerators'])],
+        ['Estimated core-pairs', str(cluster['est_core_pairs']),
+         'ceil(billable CPU capacity / 2) — based on the nodes you actually pay for.'],
+        ['Subscriptions required', str(cluster['subscriptions']),
+         'One OpenShift subscription unit covers 2 cores, i.e. 4 vCPUs where two '
+         'vCPUs present as one core. Rounded up per node and summed, because a '
+         'part-used subscription cannot be shared between nodes.'],
     ]
+    if cluster['subscriptions_pooled'] != cluster['subscriptions']:
+        sizing_rows.append([
+            'Subscriptions if pooled', str(cluster['subscriptions_pooled']),
+            'The same billable capacity rounded up once rather than per node. Lower '
+            'than the figure above because per-node rounding wastes part of a unit on '
+            'nodes whose vCPU count is not a multiple of {0}.'.format(
+                VCPUS_PER_SUBSCRIPTION)])
+    if cluster.get('collector_core_pairs') not in (None, ''):
+        sizing_rows.append([
+            'Collector core-pair figure', str(cluster['collector_core_pairs']),
+            'What cluster_summary.csv recorded. It derives from every node carrying '
+            'the worker role, so it includes exempt infra capacity.'])
+    sizing_rows.append([
+        'AI accelerator add-on signal', cluster['accel_addon_signal'] or 'No',
+        '{0} accelerator(s) detected across all nodes.'.format(cluster['total_accelerators'])])
+
     story.append(data_table(['Measure', 'Value', 'Basis'], sizing_rows,
                             [58 * mm, 24 * mm, 149 * mm], styles, align_right=(1,)))
 
@@ -560,6 +832,7 @@ def estate_story(clusters, styles):
             c['platform_type'] or '-', str(c['nodes_total']),
             str(len(c['billable'])), str(len(c['exempt'])),
             '{0:.2f}'.format(c['worker_capacity']), str(c['est_core_pairs']),
+            str(c['subscriptions']),
             ', '.join(a['name'] for a in c['detected_addons']) or '-',
         ])
     totals = [
@@ -569,17 +842,18 @@ def estate_story(clusters, styles):
         str(sum(len(c['exempt']) for c in clusters)),
         '{0:.2f}'.format(sum(c['worker_capacity'] for c in clusters)),
         str(sum(c['est_core_pairs'] for c in clusters)),
+        str(sum(c['subscriptions'] for c in clusters)),
         '',
     ]
     rows.append(totals)
 
     table = data_table(
         ['Cluster', 'Topology', 'Version', 'Platform', 'Nodes', 'Billable',
-         'Exempt', 'Worker cores', 'Core-pairs', 'Add-ons detected'],
+         'Exempt', 'Worker cores', 'Core-pairs', 'Subs', 'Add-ons detected'],
         rows,
-        [42 * mm, 19 * mm, 17 * mm, 18 * mm, 14 * mm, 17 * mm, 15 * mm,
-         22 * mm, 19 * mm, 48 * mm],
-        styles, align_right=(4, 5, 6, 7, 8))
+        [40 * mm, 18 * mm, 16 * mm, 17 * mm, 13 * mm, 16 * mm, 14 * mm,
+         21 * mm, 18 * mm, 13 * mm, 44 * mm],
+        styles, align_right=(4, 5, 6, 7, 8, 9))
     table.setStyle(TableStyle([
         ('BACKGROUND', (0, len(rows)), (-1, len(rows)), BAND),
         ('LINEABOVE', (0, len(rows)), (-1, len(rows)), 0.8, INK),
@@ -592,25 +866,99 @@ def estate_story(clusters, styles):
     return story
 
 
+def node_inventory_story(clusters, styles):
+    """Every node across every cluster, as a flat reference table."""
+    story = [Paragraph('Node inventory', styles['h1'])]
+
+    total = sum(c['nodes_total'] for c in clusters)
+    story.append(Paragraph(
+        'All {0} node(s) across {1} cluster(s), billable and exempt alike.'
+        .format(total, len(clusters)), styles['body']))
+    story.append(Spacer(1, 6))
+
+    rows = []
+    for cluster in clusters:
+        tagged = ([(n, 'Yes') for n in cluster['billable']]
+                  + [(n, 'No') for n in cluster['exempt']])
+        for n, billable in sorted(tagged, key=lambda pair: pair[0]['name']):
+            rows.append([
+                n['name'],
+                cluster['cluster_name'],
+                wrappable(n['role']) or '-',
+                n['created'] or '-',
+                '{0:.0f}'.format(n['cpu_capacity']),
+                n['memory'] or '-',
+                n['taints'] or 'None',
+                billable,
+                str(n['subscriptions']) if billable == 'Yes' else '-',
+            ])
+
+    total_vcpu = sum(n['cpu_capacity']
+                     for c in clusters for n in c['billable'] + c['exempt'])
+    rows.append([
+        'TOTAL — {0} node(s)'.format(total), '', '', '',
+        '{0:.0f}'.format(total_vcpu), '', '',
+        '{0} billable'.format(sum(len(c['billable']) for c in clusters)),
+        str(sum(c['subscriptions'] for c in clusters)),
+    ])
+
+    table = data_table(
+        ['Node', 'Cluster', 'Roles', 'Created', 'vCPU', 'RAM (GiB)', 'Taints',
+         'Billable', 'Subs'],
+        rows,
+        [55 * mm, 30 * mm, 22 * mm, 20 * mm, 13 * mm, 18 * mm, 64 * mm,
+         17 * mm, 12 * mm],
+        styles, align_right=(4, 5, 8))
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, len(rows)), (-1, len(rows)), BAND),
+        ('LINEABOVE', (0, len(rows)), (-1, len(rows)), 0.8, INK),
+    ]))
+    story.append(table)
+
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(
+        'vCPU is CPU capacity, not allocatable. RAM is node capacity as reported by '
+        'the kubelet, which is below the instance type\'s nominal memory. Subs is the '
+        'subscription units needed for that node — one unit covers 2 cores / 4 vCPUs '
+        '— and is shown only for billable nodes.',
+        styles['muted']))
+    return story
+
+
 def methodology_story(styles):
     story = [Paragraph('Methodology and caveats', styles['h1'])]
     story.append(Paragraph(
         'Every figure in this report is derived from the CSV/JSON written by '
         'ocp_inventory_cli_v3.py. Nothing is queried from the cluster at report time, '
-        'so the report is only as current as the run folder it was built from.',
+        'so the report is only as current as the data it was built from.',
+        styles['body']))
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(
+        'Billable verdicts are decided here, not read from the collector. Red Hat keys '
+        'the subscription exemption on the presence of the '
+        '<b>node-role.kubernetes.io/infra</b> label (KCS 5034771). The worker label may '
+        'legitimately sit alongside it — machine sets derived from the worker template '
+        'produce "infra,worker" nodes by design, so the node stays managed by the default '
+        'worker machine config pool — so the worker role is not considered when deciding '
+        'whether a node is infrastructure. Any node whose verdict differs from the '
+        'collector\'s is listed in the reclassified table on that cluster\'s page.',
         styles['body']))
     story.append(Spacer(1, 6))
 
     rules = [
-        ['SNO / Compact topology', 'Every node is billable',
+        ['SNO / Compact topology', 'Billable (High confidence)',
          'Control-plane nodes run user workloads in these topologies, so no node is exempt.'],
         ['Standard: control-plane', 'Exempt (High confidence)',
          'Nodes with the master or control-plane role.'],
-        ['Standard: infra-only', 'Exempt (Medium confidence)',
-         'Nodes with the infra role and not the worker role. The exemption only holds if '
-         'the node runs no user workloads — run the collector with --mode deep to validate.'],
+        ['Standard: infra label + infra taint', 'Exempt (High confidence)',
+         'The node carries node-role.kubernetes.io/infra and a NoSchedule or NoExecute '
+         'taint on that key. The taint is what keeps user workloads off, which is the '
+         'condition the exemption rests on.'],
+        ['Standard: infra label, no taint', 'Exempt (Medium confidence)',
+         'Still exempt on the label, but nothing prevents user workloads being scheduled '
+         'there. Add the taint, or validate with the collector in --mode deep.'],
         ['Standard: worker', 'Billable (High confidence)',
-         'Every remaining node, including infra-labelled nodes that also carry the worker role.'],
+         'Every remaining node.'],
     ]
     story.append(data_table(['Case', 'Verdict', 'Basis'], rules,
                             [44 * mm, 44 * mm, 143 * mm], styles))
@@ -618,14 +966,24 @@ def methodology_story(styles):
     story.append(Spacer(1, 10))
     story.append(Paragraph('Limits of this report', styles['h2']))
     for item in [
-        'Billable verdicts are heuristics based on node roles and topology. They are an '
-        'input to a subscription conversation, not a substitute for the entitlements '
+        'Billable verdicts are heuristics based on node labels, taints and topology. They '
+        'are an input to a subscription conversation, not a substitute for the entitlements '
         'recorded in your Red Hat account.',
-        'Infra-node exemptions are the most common source of error. A node labelled infra '
-        'that schedules any user workload is billable.',
-        'Core-pair figures use CPU capacity, not allocatable, and assume no hyperthreading '
-        'adjustment. Bare-metal and some virtualised platforms are subscribed on a different '
-        'basis — check the Subscription Model column per node.',
+        'A taint is evidence, not proof. It stops user workloads being scheduled onto an '
+        'infra node from now on; it says nothing about pods already running there, and a '
+        'workload carrying a matching toleration can still land. Only the collector in '
+        '--mode deep inspects what is actually running.',
+        'An infra node running any non-infrastructure workload is billable regardless of '
+        'its labels or taints. This remains the most common source of error.',
+        'Core-pair and subscription figures use CPU capacity, not allocatable. One '
+        'subscription unit covers 2 cores, taken as 4 vCPUs on the assumption that two '
+        'vCPUs present as one core — true for hyperthreaded cloud instances, but not for '
+        'a bare-metal node reporting physical cores, where 1 vCPU is 1 core and the '
+        'figures here will understate by half.',
+        'Subscriptions are rounded up per node and summed, since a part-used unit cannot '
+        'be shared between nodes. Where pooling the capacity instead would give a lower '
+        'number, both are shown. Bare-metal and some virtualised platforms are subscribed '
+        'on a different basis entirely — check the Subscription Model column per node.',
         'Add-on status reflects what was visible to the collecting account. A NOT FOUND '
         'result can mean the add-on is absent or that RBAC hid it; check collection_summary.csv '
         'in the run folder for API calls that were denied.',
@@ -677,7 +1035,7 @@ def build_pdf(clusters, out_path, sources):
 
     story = [
         Paragraph(heading, styles['title']),
-        Paragraph('Generated {0} from {1} run folder(s) collected by '
+        Paragraph('Generated {0} from {1} source(s) collected by '
                   'ocp_inventory_cli_v3.py. All verdicts are heuristic.'
                   .format(generated, len(sources)), styles['subtitle']),
         Spacer(1, 10),
@@ -686,14 +1044,19 @@ def build_pdf(clusters, out_path, sources):
     total_billable = sum(len(c['billable']) for c in clusters)
     total_nodes = sum(c['nodes_total'] for c in clusters)
     total_pairs = sum(c['est_core_pairs'] for c in clusters)
+    total_subs = sum(c['subscriptions'] for c in clusters)
     story.append(Paragraph(
         '<b>Headline:</b> {0} billable node(s) across {1} total node(s); '
-        '{2} estimated core-pair(s).'.format(total_billable, total_nodes, total_pairs),
+        '{2} estimated core-pair(s); {3} subscription unit(s) required.'.format(
+            total_billable, total_nodes, total_pairs, total_subs),
         styles['body']))
 
     if multi:
         story.append(Spacer(1, 8))
         story.extend(estate_story(clusters, styles))
+
+    story.append(PageBreak())
+    story.extend(node_inventory_story(clusters, styles))
 
     for cluster in clusters:
         story.append(PageBreak())
@@ -703,7 +1066,7 @@ def build_pdf(clusters, out_path, sources):
     story.extend(methodology_story(styles))
 
     story.append(Spacer(1, 10))
-    story.append(Paragraph('Source run folders', styles['h2']))
+    story.append(Paragraph('Sources', styles['h2']))
     for src in sources:
         story.append(Paragraph(src, styles['muted']))
 
@@ -728,6 +1091,8 @@ def print_console_summary(clusters):
         print('  Exempt nodes        : {0}'.format(len(c['exempt'])))
         print('  Worker CPU capacity : {0:.2f} cores'.format(c['worker_capacity']))
         print('  Est. core-pairs     : {0}'.format(c['est_core_pairs']))
+        print('  SUBSCRIPTIONS       : {0}  (1 unit = 2 cores / {1} vCPUs)'.format(
+            c['subscriptions'], VCPUS_PER_SUBSCRIPTION))
         detected = ', '.join(a['name'] for a in c['detected_addons']) or 'none detected'
         print('  Add-ons             : {0}'.format(detected))
         for note in c['discrepancies']:
@@ -739,6 +1104,8 @@ def print_console_summary(clusters):
             sum(len(c['billable']) for c in clusters)))
         print('ESTATE TOTAL core-pairs     : {0}'.format(
             sum(c['est_core_pairs'] for c in clusters)))
+        print('ESTATE TOTAL subscriptions  : {0}'.format(
+            sum(c['subscriptions'] for c in clusters)))
         print('')
 
 
@@ -757,21 +1124,42 @@ def main():
         epilog='Example: python3 billable_report_v3.py OCP_Inventory_abc_cluster_20261009')
     parser.add_argument('folders', nargs='*',
                         help='One or more run folders (or parent directories containing them)')
-    parser.add_argument('--input', help='Directory to scan for run folders')
+    parser.add_argument('--input',
+                        help='A nodes.csv file (per-cluster or combined_nodes.csv), '
+                             'or a directory to scan for run folders')
     parser.add_argument('-o', '--output', help='Output PDF path (default: auto-named)')
     parser.add_argument('--no-pdf', action='store_true',
                         help='Print the console summary only; skip PDF generation')
     args = parser.parse_args()
 
     if not args.folders and not args.input:
-        parser.error('give at least one run folder, or --input <dir> to scan')
+        parser.error('give at least one run folder, or --input <nodes.csv|dir>')
 
-    folders = find_run_folders(args.folders, args.input)
-    if not folders:
+    clusters = []
+    sources = []
+
+    # --input pointing at a file is the nodes.csv path.
+    scan_root = args.input
+    if args.input and os.path.isfile(args.input):
+        scan_root = None
+        clusters.extend(analyse_nodes_csv(args.input))
+        if not clusters:
+            sys.stderr.write('ERROR: no usable node rows in {0}\n'.format(args.input))
+            return 2
+        sources.append(os.path.abspath(args.input))
+    elif args.input and not os.path.isdir(args.input):
+        sys.stderr.write('ERROR: --input is neither a file nor a directory: {0}\n'
+                         .format(args.input))
+        return 2
+
+    folders = find_run_folders(args.folders, scan_root)
+    clusters.extend(analyse_cluster(f) for f in folders)
+    sources.extend(folders)
+
+    if not clusters:
         sys.stderr.write('ERROR: no run folders found (a run folder must contain nodes.csv)\n')
         return 2
 
-    clusters = [analyse_cluster(f) for f in folders]
     print_console_summary(clusters)
 
     if args.no_pdf:
@@ -789,7 +1177,7 @@ def main():
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir)
 
-    build_pdf(clusters, out_path, folders)
+    build_pdf(clusters, out_path, sources)
     print('PDF report written to: {0}'.format(out_path))
     return 0
 

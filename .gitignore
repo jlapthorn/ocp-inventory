@@ -1,8 +1,18 @@
 .claude/
 __pycache__/
 *.pyc
+
 # Collector run folders and their archives (contain real cluster inventory)
 OCP_Inventory_*/
 ocp_inventory_*/
-billable_report_*.pdf
 *.zip
+
+# Working directory for collected clusters: run folders, combiner output and
+# any generated test fixtures. Regenerate test data with make_test_nodes_csv.py.
+clusters/
+combined_outputs/
+combined_*.csv
+combiner_run_log.csv
+
+# Generated reports
+billable_report_*.pdf
