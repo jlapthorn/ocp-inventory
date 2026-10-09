@@ -306,7 +306,6 @@ def summarise_node_rows(nodes, topology):
             'name': node.get('Node Name', '') or '(unnamed)',
             'role': role,
             'created': node.get('Creation Date', '') or '',
-            'instance_type': node.get('Instance Type', '') or '',
             'zone': node.get('Zone', '') or '',
             'cpu_capacity': cpu_to_cores(node.get('CPU Capacity (vCPUs)', '')),
             'cpu_allocatable': cpu_to_cores(node.get('CPU Allocatable (vCPUs)', '')),
@@ -687,7 +686,6 @@ def cluster_story(cluster, styles, multi_cluster):
             rows.append([
                 n['name'],
                 wrappable(n['role']),
-                n['instance_type'] or '-',
                 '{0:.0f}'.format(n['cpu_capacity']),
                 '{0:.2f}'.format(n['cpu_allocatable']),
                 n['sub_model'] or '-',
@@ -696,18 +694,18 @@ def cluster_story(cluster, styles, multi_cluster):
                 '{0} / {1}'.format(n['confidence'] or '-', n['evidence'] or '-'),
             ])
         rows.append([
-            'TOTAL — {0} billable node(s)'.format(len(cluster['billable'])), '', '',
+            'TOTAL — {0} billable node(s)'.format(len(cluster['billable'])), '',
             '{0:.0f}'.format(cluster['billable_capacity']), '', '',
             str(cluster['subscriptions']),
             str(sum(n['accelerators'] for n in cluster['billable'])) or '-', '',
         ])
         table = data_table(
-            ['Node', 'Role', 'Instance type', 'vCPU cap', 'vCPU alloc',
+            ['Node', 'Role', 'vCPU cap', 'vCPU alloc',
              'Sub model', 'Subs', 'Accel', 'Confidence / evidence'],
             rows,
-            [58 * mm, 23 * mm, 21 * mm, 15 * mm, 16 * mm, 19 * mm, 12 * mm,
-             12 * mm, 57 * mm],
-            styles, align_right=(3, 4, 6, 7))
+            [64 * mm, 23 * mm, 15 * mm, 16 * mm, 23 * mm, 12 * mm,
+             12 * mm, 68 * mm],
+            styles, align_right=(2, 3, 5, 6))
         table.setStyle(TableStyle([
             ('BACKGROUND', (0, len(rows)), (-1, len(rows)), BAND),
             ('LINEABOVE', (0, len(rows)), (-1, len(rows)), 0.8, INK),
@@ -720,21 +718,20 @@ def cluster_story(cluster, styles, multi_cluster):
     story.append(Paragraph('Exempt nodes', styles['h2']))
     if cluster['exempt']:
         rows = []
-        rows = []
         for n in sorted(cluster['exempt'], key=lambda x: x['name']):
             is_infra = 'infra' in n['role'].lower()
             rows.append([
-                n['name'], wrappable(n['role']), n['instance_type'] or '-',
+                n['name'], wrappable(n['role']),
                 '{0:.0f}'.format(n['cpu_capacity']),
                 ('Yes' if n['infra_taint'] else 'No') if is_infra else 'n/a',
                 n['confidence'] or '-', n['evidence'] or '-',
             ])
         story.append(data_table(
-            ['Node', 'Role', 'Instance type', 'vCPU cap', 'Infra taint',
-             'Confidence', 'Exemption basis'],
+            ['Node', 'Role', 'vCPU cap', 'Infra taint', 'Confidence',
+             'Exemption basis'],
             rows,
-            [56 * mm, 26 * mm, 22 * mm, 15 * mm, 17 * mm, 19 * mm, 82 * mm],
-            styles, align_right=(3,)))
+            [60 * mm, 26 * mm, 15 * mm, 17 * mm, 19 * mm, 95 * mm],
+            styles, align_right=(2,)))
     else:
         story.append(Paragraph('No exempt nodes — every node in this cluster is billable.',
                                styles['body']))
